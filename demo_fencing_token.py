@@ -10,7 +10,11 @@
 import time
 import threading
 import sys
+import io
+import os
 from typing import Optional
+
+os.environ.setdefault('PYTHONUTF8', '1')
 
 try:
     import redis
@@ -271,8 +275,177 @@ def scenario_safe_with_fencing(redis_client, resource: FencedResource, lock_key:
 
 
 # ======================================================================
-# 为什么延长 TTL / 看门狗 不能根治问题?
+# 场景三: 看门狗续期 + 同 token 多次写入 + 旧 token 被拒绝
 # ======================================================================
+def scenario_watchdog_and_multi_write(redis_client, resource: FencedResource,
+                                       lock_key: str,
+                                       ttl: int = 2, business_time: float = 5.0):
+    """
+    验证三个关键行为:
+
+    1. 看门狗续期: Client-A 持锁执行业务 {business_time}s, 超过 TTL={ttl}s,
+       但看门狗在后台续期 → Client-B 在原 TTL 到点时抢不到锁。
+
+    2. 同 token 多次写入: Client-A 在一次持锁期间用同一个 fencing token
+       连续写 3 次资源, 全部应该成功。
+
+    3. 旧 token 被拒绝: Client-A 释放锁后, Client-B 获取新锁 (更大 token)。
+       此后 Client-A 用旧 token 再写 → 应该被拒绝。
+
+    时序:
+      t=0     Client-A 获取锁, token=T_A, 看门狗启动 (TTL={ttl}s)
+      t=0.5   Client-B 尝试抢锁 → 失败 (A 的锁还在, 看门狗续期中)
+      t=1     Client-A 写入 #1 (token=T_A)  → balance += 10
+      t=2     原始 TTL 到了 → 但看门狗已续期, 锁仍在
+      t=2.5   Client-B 再次尝试抢锁 → 仍然失败
+      t=3     Client-A 写入 #2 (token=T_A)  → balance += 20
+      t=4     Client-A 写入 #3 (token=T_A)  → balance += 30
+      t=5     Client-A 主动释放锁, 看门狗停止
+      t=5.1   Client-B 获取锁, token=T_B (> T_A)
+      t=5.5   Client-B 写入 (token=T_B)     → balance += 50
+      t=6     Client-A 用旧 token=T_A 再写  → REJECTED!
+    """
+    print("\n" + "#" * 70)
+    print("# SCENARIO 3: 看门狗续期 + 同 token 多次写入 + 旧 token 被拒绝")
+    print("#")
+    print(f"# TTL={ttl}s, 业务执行时间={business_time}s (> TTL)")
+    print("# 看门狗开启 → 在业务执行期间持续续期,锁不会过期")
+    print("#" * 70)
+
+    a_lock_ref: list = [None]
+    a_token_ref: list = [None]
+    phase = threading.Barrier(2, timeout=15)
+
+    results_a: list = []
+    results_b: list = []
+    results_late_a: list = []
+
+    def client_a():
+        lock_a = RedisDistributedLock(redis_client, lock_key, ttl_seconds=ttl,
+                                      watchdog_enabled=True)
+        token = lock_a.acquire(timeout_seconds=5)
+        if token is None:
+            print("  [Client-A] ❌ Failed to acquire lock")
+            phase.wait()
+            return
+        a_lock_ref[0] = lock_a
+        a_token_ref[0] = token
+        print(f"  [Client-A] ✅ Acquired lock, fencing_token={token}, "
+              f"watchdog started (interval={lock_a.watchdog_interval:.1f}s)")
+
+        # 通知 B 可以开始尝试抢锁
+        phase.wait()
+
+        # ---- 写入 #1 ----
+        time.sleep(1.0)
+        ok, msg = resource.write_fenced("Client-A", +10, token)
+        results_a.append(("write-1", ok, msg))
+        print(f"  [Client-A] write #1: {msg}")
+
+        # ---- 模拟业务执行 (超过原始 TTL) ----
+        time.sleep(business_time / 2)
+
+        # ---- 写入 #2 (同一 token) ----
+        ok, msg = resource.write_fenced("Client-A", +20, token)
+        results_a.append(("write-2", ok, msg))
+        print(f"  [Client-A] write #2: {msg}")
+
+        # ---- 继续业务 ----
+        time.sleep(business_time / 2 - 1.0)
+
+        # ---- 写入 #3 (同一 token) ----
+        ok, msg = resource.write_fenced("Client-A", +30, token)
+        results_a.append(("write-3", ok, msg))
+        print(f"  [Client-A] write #3: {msg}")
+
+        # ---- 主动释放锁 ----
+        released = lock_a.release()
+        print(f"  [Client-A] 🔓 Released lock (release={released}), watchdog stopped")
+
+    def client_b():
+        # 等待 A 获取锁
+        phase.wait()
+
+        # ---- 原始 TTL 到点时尝试抢锁 → 应该失败 (看门狗在续期) ----
+        time.sleep(ttl + 0.5)
+        t_now_1 = ttl + 0.5
+        lock_b = RedisDistributedLock(redis_client, lock_key, ttl_seconds=ttl,
+                                      watchdog_enabled=False)
+        token_b = lock_b.acquire(timeout_seconds=0.5)
+        if token_b is None:
+            print(f"  [Client-B] 🚫 Failed to grab lock at t≈{t_now_1:.1f}s "
+                  f"(watchdog is renewing — GOOD)")
+        else:
+            print(f"  [Client-B] ⚠️ Unexpectedly grabbed lock at t≈{t_now_1:.1f}s!")
+            lock_b.release()
+            return
+
+        # ---- 再等 1.5s, 仍然在 A 持锁期间 (A 约 5s 后才释放) ----
+        time.sleep(1.5)
+        t_now_2 = t_now_1 + 1.5
+        lock_b2 = RedisDistributedLock(redis_client, lock_key, ttl_seconds=ttl,
+                                       watchdog_enabled=False)
+        token_b2 = lock_b2.acquire(timeout_seconds=0.5)
+        if token_b2 is None:
+            print(f"  [Client-B] 🚫 Failed to grab lock at t≈{t_now_2:.1f}s "
+                  f"(watchdog still renewing — GOOD)")
+        else:
+            print(f"  [Client-B] ⚠️ Unexpectedly grabbed lock at t≈{t_now_2:.1f}s!")
+            lock_b2.release()
+            return
+
+        # ---- 等 A 完成业务并释放锁 ----
+        time.sleep(business_time - t_now_2 + 1.5)
+        lock_b3 = RedisDistributedLock(redis_client, lock_key, ttl_seconds=ttl,
+                                       watchdog_enabled=False)
+        token_b3 = lock_b3.acquire(timeout_seconds=5)
+        if token_b3 is None:
+            print("  [Client-B] ❌ Failed to acquire lock after A released (unexpected)")
+            return
+        print(f"  [Client-B] ✅ Acquired lock after A released, fencing_token={token_b3}")
+
+        # ---- B 写入资源 ----
+        ok, msg = resource.write_fenced("Client-B", +50, token_b3)
+        results_b.append(("write-B", ok, msg))
+        print(f"  [Client-B] write: {msg}")
+
+        # ---- A 用旧 token 迟到写入 ----
+        old_token = a_token_ref[0]
+        if old_token is not None:
+            time.sleep(0.5)
+            ok, msg = resource.write_fenced("Client-A(late)", +999, old_token)
+            results_late_a.append(("late-write", ok, msg))
+            print(f"  [Client-A(late)] stale write: {msg}")
+
+        lock_b3.release()
+        print(f"  [Client-B] 🔓 Released lock normally")
+
+    ta = threading.Thread(target=client_a, name="Client-A-Watchdog")
+    tb = threading.Thread(target=client_b, name="Client-B-Watchdog")
+    ta.start()
+    tb.start()
+    ta.join(timeout=30)
+    tb.join(timeout=30)
+
+    # ---- 汇总验证 ----
+    print("\n  ──── Verification ────")
+
+    all_a_writes_ok = all(ok for _, ok, _ in results_a)
+    b_write_ok = all(ok for _, ok, _ in results_b)
+    late_a_rejected = all(not ok for _, ok, _ in results_late_a)
+
+    expected_balance = 10 + 20 + 30 + 50  # 110
+
+    print(f"  Client-A 3 writes with same token:  {'✅ ALL ACCEPTED' if all_a_writes_ok else '❌ SOME REJECTED'}")
+    print(f"  Client-B write with new token:      {'✅ ACCEPTED' if b_write_ok else '❌ REJECTED'}")
+    print(f"  Client-A late write with old token: {'✅ REJECTED' if late_a_rejected else '❌ ACCEPTED (BUG!)'}")
+    print(f"  Expected balance: {expected_balance}")
+    print(f"  Actual balance:   {resource.balance}")
+    print(f"  Balance match:    {'✅' if resource.balance == expected_balance else '❌ MISMATCH'}")
+    resource.print_log()
+
+
+
 def explain_why_ttl_extension_is_not_enough():
     print("\n" + "#" * 70)
     print("# WHY LONGER TTL / WATCHDOG ≠ 根治方案")
@@ -355,6 +528,17 @@ def main():
     scenario_safe_with_fencing(redis_client, resource_safe,
                                lock_key="demo:lock:safe",
                                ttl=3, gc_pause=5.0)
+
+    # 场景 3: 看门狗续期 + 同 token 多次写入 + 旧 token 被拒绝
+    if hasattr(redis_client, 'flushall'):
+        try:
+            redis_client.flushall()
+        except Exception:
+            pass
+    resource_watchdog = FencedResource("watchdog-account", initial_balance=0)
+    scenario_watchdog_and_multi_write(redis_client, resource_watchdog,
+                                      lock_key="demo:lock:watchdog",
+                                      ttl=2, business_time=5.0)
 
     # 为什么 TTL / 看门狗 不够
     explain_why_ttl_extension_is_not_enough()

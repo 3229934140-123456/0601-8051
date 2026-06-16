@@ -15,14 +15,19 @@ class FencedResource:
     1. 每次成功获取锁时,锁服务返回一个单调递增的 fencing token。
     2. 客户端对资源发起写操作时,必须携带这个 token。
     3. 资源端持久化记录自己"已经接受过的最大 token" (processed_token)。
-    4. 任何写操作的 token <= processed_token 时,资源端直接拒绝。
+    4. 任何写操作的 token < processed_token 时,资源端直接拒绝。
+       同一 token (token == processed_token) 允许连续多次写入——
+       同一持锁方在一次持锁期间可以多次操作资源,只有资源已经见过
+       更大的 token 时,旧 token 的迟到操作才应该被拒绝。
 
     为什么这样就安全了?
         假设 token 是严格单调递增的:
         - 如果客户端 B 成功获取了锁,它拿到的 token_N 一定 > 所有历史 token。
         - 不管过期的客户端 A 多晚到达,它携带的 token_M 一定满足 M < N。
-        - 资源只要见过 token_N,就永远不会再接受 token_M 或更小的值。
-        => A 的"迟到操作"必然被拒绝,不会污染数据。
+        - 资源只要见过 token_N (processed_token=N),就永远不会再接受 M<N 的值。
+        - 但 M==N (同一持锁方的后续操作) 是合法的,因为 token 相等说明
+          这些操作来自同一代锁持有者,不存在并发冲突。
+        => A 的"迟到操作"(M<N) 必然被拒绝,不会污染数据。
     """
 
     def __init__(self, resource_name: str, initial_balance: int = 0):
@@ -64,11 +69,13 @@ class FencedResource:
         """
         校验 fencing token 的写操作。
 
-        规则: fencing_token 必须严格大于当前已处理的最大 token 才会被接受。
-        这保证了操作顺序与锁的颁发顺序严格一致。
+        规则: fencing_token < processed_token 时拒绝 (资源已见过更大的 token,
+        说明此操作来自过期锁持有者)。fencing_token >= processed_token 时接受:
+          - token == processed_token: 同一持锁方的后续操作,合法
+          - token >  processed_token: 新锁持有者的首次操作,合法
         """
         with self._mu:
-            if fencing_token <= self._processed_token:
+            if fencing_token < self._processed_token:
                 self._operation_log.append({
                     "mode": "fenced",
                     "client": client_id,
@@ -79,7 +86,7 @@ class FencedResource:
                     "reason": "stale token (expired lock holder)",
                 })
                 return False, (
-                    f"[REJECTED] {client_id} token={fencing_token} <= "
+                    f"[REJECTED] {client_id} token={fencing_token} < "
                     f"processed_token={self._processed_token}. "
                     f"This client's lock has EXPIRED — another client acquired the lock first."
                 )

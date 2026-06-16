@@ -151,6 +151,8 @@ class RedisDistributedLock:
 
                 try:
                     current_value = self.redis.get(self.lock_key)
+                    if isinstance(current_value, bytes):
+                        current_value = current_value.decode()
                     if current_value == self._owner_value:
                         self.redis.expire(self.lock_key, self.ttl_seconds)
                     else:
